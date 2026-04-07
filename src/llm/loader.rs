@@ -1,23 +1,269 @@
 //! Model loading utilities
 //!
-//! Handles loading LLaMA 3 weights from SafeTensors format.
+//! Handles loading LLaMA weights from SafeTensors format into Burn tensors.
 
 use anyhow::{Context, Result};
+use burn::module::Param;
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
+use burn::prelude::*;
 use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::config::LlamaConfig;
 
-/// Model loader for LLaMA weights
+/// Cached SafeTensor data for efficient weight loading
+pub struct SafeTensorData {
+    /// Raw bytes of all safetensor files
+    buffers: Vec<Vec<u8>>,
+    /// Mapping from weight name to buffer index
+    name_to_buffer: HashMap<String, usize>,
+}
+
+impl SafeTensorData {
+    /// Load all safetensor files from a directory
+    pub fn load(model_path: &PathBuf) -> Result<Self> {
+        let mut buffers = Vec::new();
+        let mut name_to_buffer = HashMap::new();
+
+        // Find all .safetensors files
+        let mut files: Vec<PathBuf> = std::fs::read_dir(model_path)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "safetensors").unwrap_or(false))
+            .collect();
+        files.sort();
+
+        if files.is_empty() {
+            anyhow::bail!("No .safetensors files found in {:?}", model_path);
+        }
+
+        info!("Loading {} safetensor files", files.len());
+
+        for file_path in files {
+            let mut file = File::open(&file_path)
+                .with_context(|| format!("Failed to open {:?}", file_path))?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)?;
+
+            let buffer_idx = buffers.len();
+
+            // Parse to get tensor names
+            let tensors = SafeTensors::deserialize(&buffer)
+                .with_context(|| format!("Failed to parse {:?}", file_path))?;
+
+            for name in tensors.names() {
+                name_to_buffer.insert(name.to_string(), buffer_idx);
+            }
+
+            buffers.push(buffer);
+            debug!("Loaded {:?}", file_path);
+        }
+
+        info!("Found {} weight tensors", name_to_buffer.len());
+        Ok(Self {
+            buffers,
+            name_to_buffer,
+        })
+    }
+
+    /// Get a 1D tensor by name
+    pub fn get_tensor_1d<B: Backend>(
+        &self,
+        name: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 1>> {
+        let buffer_idx = self
+            .name_to_buffer
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", name))?;
+
+        let tensors = SafeTensors::deserialize(&self.buffers[*buffer_idx])?;
+        let tensor_view = tensors.tensor(name)?;
+        let shape = tensor_view.shape();
+        let data = tensor_view.data();
+
+        // Verify shape
+        if shape.len() != 1 {
+            anyhow::bail!("Expected 1D tensor for {}, got shape {:?}", name, shape);
+        }
+
+        let floats = self.convert_to_f32(data, tensor_view.dtype())?;
+        let tensor_data = burn::tensor::TensorData::new(floats, vec![shape[0]]);
+        Ok(Tensor::from_data(tensor_data, device))
+    }
+
+    /// Get a 2D tensor by name
+    pub fn get_tensor_2d<B: Backend>(
+        &self,
+        name: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 2>> {
+        let buffer_idx = self
+            .name_to_buffer
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", name))?;
+
+        let tensors = SafeTensors::deserialize(&self.buffers[*buffer_idx])?;
+        let tensor_view = tensors.tensor(name)?;
+        let shape = tensor_view.shape();
+        let data = tensor_view.data();
+
+        // Verify shape
+        if shape.len() != 2 {
+            anyhow::bail!("Expected 2D tensor for {}, got shape {:?}", name, shape);
+        }
+
+        let floats = self.convert_to_f32(data, tensor_view.dtype())?;
+        let tensor_data = burn::tensor::TensorData::new(floats, vec![shape[0], shape[1]]);
+        Ok(Tensor::from_data(tensor_data, device))
+    }
+
+    /// Check if a weight exists
+    pub fn has_weight(&self, name: &str) -> bool {
+        self.name_to_buffer.contains_key(name)
+    }
+
+    /// Convert raw bytes to f32 based on dtype
+    fn convert_to_f32(&self, data: &[u8], dtype: safetensors::Dtype) -> Result<Vec<f32>> {
+        match dtype {
+            safetensors::Dtype::F32 => Ok(data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()),
+            safetensors::Dtype::F16 => Ok(data
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    half::f16::from_bits(bits).to_f32()
+                })
+                .collect()),
+            safetensors::Dtype::BF16 => Ok(data
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = u16::from_le_bytes([c[0], c[1]]);
+                    half::bf16::from_bits(bits).to_f32()
+                })
+                .collect()),
+            dtype => anyhow::bail!("Unsupported dtype: {:?}", dtype),
+        }
+    }
+}
+
+/// Load a Linear layer with weights from SafeTensors
+pub fn load_linear<B: Backend>(
+    data: &SafeTensorData,
+    weight_name: &str,
+    in_features: usize,
+    out_features: usize,
+    device: &B::Device,
+) -> Result<Linear<B>> {
+    debug!(
+        "Loading linear: {} [{} x {}]",
+        weight_name, out_features, in_features
+    );
+
+    // HuggingFace stores weights as [out_features, in_features]
+    let weight = data.get_tensor_2d::<B>(weight_name, device)?;
+
+    // Verify shape
+    let [rows, cols] = weight.dims();
+    if rows != out_features || cols != in_features {
+        anyhow::bail!(
+            "Shape mismatch for {}: expected [{}, {}], got [{}, {}]",
+            weight_name,
+            out_features,
+            in_features,
+            rows,
+            cols
+        );
+    }
+
+    // Burn Linear layers expect weights as [in_features, out_features]
+    // but HuggingFace stores them as [out_features, in_features], so we need to transpose
+    let weight_transposed = weight.swap_dims(0, 1);
+
+    // Create Linear with no bias
+    let mut linear = LinearConfig::new(in_features, out_features)
+        .with_bias(false)
+        .init(device);
+
+    // Replace the weight
+    linear.weight = Param::from_tensor(weight_transposed);
+
+    Ok(linear)
+}
+
+/// Load an Embedding layer with weights from SafeTensors
+pub fn load_embedding<B: Backend>(
+    data: &SafeTensorData,
+    weight_name: &str,
+    vocab_size: usize,
+    embedding_dim: usize,
+    device: &B::Device,
+) -> Result<Embedding<B>> {
+    debug!(
+        "Loading embedding: {} [{} x {}]",
+        weight_name, vocab_size, embedding_dim
+    );
+
+    let weight = data.get_tensor_2d::<B>(weight_name, device)?;
+
+    // Verify shape
+    let [rows, cols] = weight.dims();
+    if rows != vocab_size || cols != embedding_dim {
+        anyhow::bail!(
+            "Shape mismatch for {}: expected [{}, {}], got [{}, {}]",
+            weight_name,
+            vocab_size,
+            embedding_dim,
+            rows,
+            cols
+        );
+    }
+
+    let mut embedding = EmbeddingConfig::new(vocab_size, embedding_dim).init(device);
+    embedding.weight = Param::from_tensor(weight);
+
+    Ok(embedding)
+}
+
+/// Load RMSNorm weight from SafeTensors (returns just the weight tensor)
+pub fn load_rms_norm_weight<B: Backend>(
+    data: &SafeTensorData,
+    weight_name: &str,
+    hidden_size: usize,
+    device: &B::Device,
+) -> Result<Tensor<B, 1>> {
+    debug!("Loading rms_norm: {} [{}]", weight_name, hidden_size);
+
+    let weight = data.get_tensor_1d::<B>(weight_name, device)?;
+
+    // Verify shape
+    let [size] = weight.dims();
+    if size != hidden_size {
+        anyhow::bail!(
+            "Shape mismatch for {}: expected [{}], got [{}]",
+            weight_name,
+            hidden_size,
+            size
+        );
+    }
+
+    Ok(weight)
+}
+
+/// Model loader that orchestrates loading all weights
 pub struct ModelLoader {
     /// Path to model directory
-    model_path: PathBuf,
+    pub model_path: PathBuf,
     /// Model configuration
-    config: LlamaConfig,
+    pub config: LlamaConfig,
+    /// Cached weight data
+    pub weights: Option<SafeTensorData>,
 }
 
 impl ModelLoader {
@@ -31,7 +277,11 @@ impl ModelLoader {
             LlamaConfig::llama3_8b()
         };
 
-        Ok(Self { model_path, config })
+        Ok(Self {
+            model_path,
+            config,
+            weights: None,
+        })
     }
 
     /// Get model configuration
@@ -39,116 +289,20 @@ impl ModelLoader {
         &self.config
     }
 
-    /// Find all safetensor files in the model directory
-    pub fn find_weight_files(&self) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-
-        for entry in std::fs::read_dir(&self.model_path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path
-                .extension()
-                .map(|e| e == "safetensors")
-                .unwrap_or(false)
-            {
-                files.push(path);
-            }
+    /// Load weights into memory
+    pub fn load_weights(&mut self) -> Result<()> {
+        if self.weights.is_none() {
+            info!("Loading model weights from {:?}", self.model_path);
+            self.weights = Some(SafeTensorData::load(&self.model_path)?);
         }
-
-        if files.is_empty() {
-            anyhow::bail!("No .safetensors files found in {:?}", self.model_path);
-        }
-
-        files.sort();
-        info!("Found {} weight files", files.len());
-        Ok(files)
+        Ok(())
     }
 
-    /// Load weight names from safetensor files
-    pub fn load_weight_names(&self) -> Result<HashMap<String, PathBuf>> {
-        let files = self.find_weight_files()?;
-        let mut weight_map = HashMap::new();
-
-        for file_path in files {
-            let mut file = File::open(&file_path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-
-            let tensors =
-                SafeTensors::deserialize(&buffer).context("Failed to deserialize safetensors")?;
-
-            for name in tensors.names() {
-                weight_map.insert(name.to_string(), file_path.clone());
-            }
-        }
-
-        info!("Found {} weights", weight_map.len());
-        Ok(weight_map)
-    }
-
-    /// Load a specific tensor by name
-    pub fn load_tensor<B: burn::prelude::Backend>(
-        &self,
-        name: &str,
-        weight_files: &HashMap<String, PathBuf>,
-        device: &B::Device,
-    ) -> Result<burn::tensor::Tensor<B, 2>> {
-        let file_path = weight_files
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", name))?;
-
-        let mut file = File::open(file_path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-
-        let tensors = SafeTensors::deserialize(&buffer)?;
-        let tensor_view = tensors.tensor(name)?;
-
-        let shape = tensor_view.shape();
-        let data = tensor_view.data();
-
-        // Convert based on dtype
-        let tensor = match tensor_view.dtype() {
-            safetensors::Dtype::F32 => {
-                let floats: Vec<f32> = data
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                    .collect();
-                burn::tensor::Tensor::<B, 1>::from_floats(floats.as_slice(), device)
-            }
-            safetensors::Dtype::F16 => {
-                let floats: Vec<f32> = data
-                    .chunks_exact(2)
-                    .map(|chunk| {
-                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                        half::f16::from_bits(bits).to_f32()
-                    })
-                    .collect();
-                burn::tensor::Tensor::<B, 1>::from_floats(floats.as_slice(), device)
-            }
-            safetensors::Dtype::BF16 => {
-                let floats: Vec<f32> = data
-                    .chunks_exact(2)
-                    .map(|chunk| {
-                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
-                        half::bf16::from_bits(bits).to_f32()
-                    })
-                    .collect();
-                burn::tensor::Tensor::<B, 1>::from_floats(floats.as_slice(), device)
-            }
-            dtype => anyhow::bail!("Unsupported dtype: {:?}", dtype),
-        };
-
-        // Reshape to 2D
-        let shape_2d = if shape.len() == 1 {
-            [shape[0], 1]
-        } else if shape.len() == 2 {
-            [shape[0], shape[1]]
-        } else {
-            anyhow::bail!("Unsupported tensor rank: {}", shape.len());
-        };
-
-        Ok(tensor.reshape(shape_2d))
+    /// Get reference to loaded weights
+    pub fn weights(&self) -> Result<&SafeTensorData> {
+        self.weights
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Weights not loaded. Call load_weights() first."))
     }
 
     /// Check if model files exist
@@ -157,9 +311,18 @@ impl ModelLoader {
             anyhow::bail!("Model path does not exist: {:?}", self.model_path);
         }
 
-        let weight_files = self.find_weight_files()?;
-        if weight_files.is_empty() {
-            anyhow::bail!("No weight files found in {:?}", self.model_path);
+        // Check for safetensor files
+        let has_safetensors = std::fs::read_dir(&self.model_path)?
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "safetensors")
+                    .unwrap_or(false)
+            });
+
+        if !has_safetensors {
+            anyhow::bail!("No .safetensors files found in {:?}", self.model_path);
         }
 
         Ok(())
@@ -171,53 +334,22 @@ impl ModelLoader {
     }
 }
 
-/// Weight mapping from HuggingFace naming to our model
-pub fn get_weight_mapping(layer_idx: usize) -> HashMap<String, String> {
-    let mut mapping = HashMap::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let prefix = format!("model.layers.{}", layer_idx);
+    #[test]
+    fn test_convert_f32() {
+        let data = SafeTensorData {
+            buffers: vec![],
+            name_to_buffer: HashMap::new(),
+        };
 
-    // Attention weights
-    mapping.insert(
-        format!("{}.self_attn.q_proj.weight", prefix),
-        format!("layers.{}.self_attn.q_proj.weight", layer_idx),
-    );
-    mapping.insert(
-        format!("{}.self_attn.k_proj.weight", prefix),
-        format!("layers.{}.self_attn.k_proj.weight", layer_idx),
-    );
-    mapping.insert(
-        format!("{}.self_attn.v_proj.weight", prefix),
-        format!("layers.{}.self_attn.v_proj.weight", layer_idx),
-    );
-    mapping.insert(
-        format!("{}.self_attn.o_proj.weight", prefix),
-        format!("layers.{}.self_attn.o_proj.weight", layer_idx),
-    );
-
-    // MLP weights
-    mapping.insert(
-        format!("{}.mlp.gate_proj.weight", prefix),
-        format!("layers.{}.mlp.gate_proj.weight", layer_idx),
-    );
-    mapping.insert(
-        format!("{}.mlp.up_proj.weight", prefix),
-        format!("layers.{}.mlp.up_proj.weight", layer_idx),
-    );
-    mapping.insert(
-        format!("{}.mlp.down_proj.weight", prefix),
-        format!("layers.{}.mlp.down_proj.weight", layer_idx),
-    );
-
-    // Layer norms
-    mapping.insert(
-        format!("{}.input_layernorm.weight", prefix),
-        format!("layers.{}.input_layernorm.weight", layer_idx),
-    );
-    mapping.insert(
-        format!("{}.post_attention_layernorm.weight", prefix),
-        format!("layers.{}.post_attention_layernorm.weight", layer_idx),
-    );
-
-    mapping
+        // Test f32 conversion
+        let bytes: Vec<u8> = vec![0, 0, 128, 63]; // 1.0f32 in little endian
+        let result = data
+            .convert_to_f32(&bytes, safetensors::Dtype::F32)
+            .unwrap();
+        assert_eq!(result, vec![1.0f32]);
+    }
 }

@@ -2,11 +2,13 @@
 //!
 //! Implements multi-head attention with Rotary Position Embeddings (RoPE).
 
-use burn::nn::{Linear, LinearConfig};
+use anyhow::Result;
+use burn::nn::Linear;
 use burn::prelude::*;
 
 use super::config::LlamaConfig;
-use super::layers::{RmsNorm, RmsNormConfig};
+use super::layers::{RmsNorm, MLP};
+use super::loader::{load_linear, SafeTensorData};
 
 /// Rotary Position Embeddings
 #[derive(Module, Debug)]
@@ -29,11 +31,14 @@ impl<B: Backend> RotaryEmbedding<B> {
             .map(|i| 1.0 / (base.powf(i as f64 / head_dim as f64)) as f32)
             .collect();
 
-        let inv_freq_tensor = Tensor::<B, 1>::from_floats(inv_freq.as_slice(), device);
+        let inv_freq_len = inv_freq.len();
+        let inv_freq_data = TensorData::new(inv_freq, vec![inv_freq_len]);
+        let inv_freq_tensor = Tensor::<B, 1>::from_data(inv_freq_data, device);
 
         // Compute position indices
         let positions: Vec<f32> = (0..max_seq_len).map(|i| i as f32).collect();
-        let positions_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device);
+        let positions_data = TensorData::new(positions, vec![max_seq_len]);
+        let positions_tensor = Tensor::<B, 1>::from_data(positions_data, device);
 
         // Compute freqs: [seq_len, head_dim/2]
         let freqs = positions_tensor.unsqueeze_dim::<2>(1) * inv_freq_tensor.unsqueeze_dim::<2>(0);
@@ -131,8 +136,10 @@ pub struct GroupedQueryAttention<B: Backend> {
 }
 
 impl<B: Backend> GroupedQueryAttention<B> {
-    /// Create new grouped query attention
+    /// Create new grouped query attention with random weights
     pub fn new(device: &B::Device, config: &LlamaConfig) -> Self {
+        use burn::nn::LinearConfig;
+
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -172,6 +179,96 @@ impl<B: Backend> GroupedQueryAttention<B> {
             head_dim,
             hidden_size,
         }
+    }
+
+    /// Create from pre-loaded Linear layers
+    pub fn from_linears(
+        q_proj: Linear<B>,
+        k_proj: Linear<B>,
+        v_proj: Linear<B>,
+        o_proj: Linear<B>,
+        rotary: RotaryEmbedding<B>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_size: usize,
+    ) -> Self {
+        Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            rotary,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            hidden_size,
+        }
+    }
+
+    /// Load from SafeTensor data
+    pub fn from_safetensors(
+        data: &SafeTensorData,
+        layer_prefix: &str,
+        config: &LlamaConfig,
+        device: &B::Device,
+    ) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+
+        let q_proj = load_linear::<B>(
+            data,
+            &format!("{}.self_attn.q_proj.weight", layer_prefix),
+            hidden_size,
+            num_heads * head_dim,
+            device,
+        )?;
+
+        let k_proj = load_linear::<B>(
+            data,
+            &format!("{}.self_attn.k_proj.weight", layer_prefix),
+            hidden_size,
+            num_kv_heads * head_dim,
+            device,
+        )?;
+
+        let v_proj = load_linear::<B>(
+            data,
+            &format!("{}.self_attn.v_proj.weight", layer_prefix),
+            hidden_size,
+            num_kv_heads * head_dim,
+            device,
+        )?;
+
+        let o_proj = load_linear::<B>(
+            data,
+            &format!("{}.self_attn.o_proj.weight", layer_prefix),
+            num_heads * head_dim,
+            hidden_size,
+            device,
+        )?;
+
+        // Rotary embeddings are computed, not loaded
+        let rotary = RotaryEmbedding::new(
+            device,
+            head_dim,
+            config.max_position_embeddings,
+            config.rope_theta,
+        );
+
+        Ok(Self::from_linears(
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            rotary,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            hidden_size,
+        ))
     }
 
     /// Forward pass
@@ -235,11 +332,9 @@ impl<B: Backend> GroupedQueryAttention<B> {
         let attn_output = attn_weights.matmul(v);
 
         // Reshape back to [batch, seq, hidden]
-        let attn_output = attn_output.swap_dims(1, 2).reshape([
-            batch_size,
-            seq_len,
-            self.num_heads * self.head_dim,
-        ]);
+        let attn_output_swapped = attn_output.swap_dims(1, 2);
+        let attn_output =
+            attn_output_swapped.reshape([batch_size, seq_len, self.num_heads * self.head_dim]);
 
         // Output projection
         let output = self.o_proj.forward(attn_output);
@@ -268,7 +363,7 @@ pub struct DecoderLayer<B: Backend> {
     /// Self attention
     self_attn: GroupedQueryAttention<B>,
     /// MLP
-    mlp: super::layers::MLP<B>,
+    mlp: MLP<B>,
     /// Input layer norm
     input_layernorm: RmsNorm<B>,
     /// Post attention layer norm
@@ -276,10 +371,12 @@ pub struct DecoderLayer<B: Backend> {
 }
 
 impl<B: Backend> DecoderLayer<B> {
-    /// Create a new decoder layer
+    /// Create a new decoder layer with random weights
     pub fn new(device: &B::Device, config: &LlamaConfig) -> Self {
+        use super::layers::RmsNormConfig;
+
         let self_attn = GroupedQueryAttention::new(device, config);
-        let mlp = super::layers::MLP::new(device, config.hidden_size, config.intermediate_size);
+        let mlp = MLP::new(device, config.hidden_size, config.intermediate_size);
         let input_layernorm: RmsNorm<B> = RmsNormConfig::new(config.hidden_size)
             .with_eps(config.rms_norm_eps)
             .init(device);
@@ -293,6 +390,65 @@ impl<B: Backend> DecoderLayer<B> {
             input_layernorm,
             post_attention_layernorm,
         }
+    }
+
+    /// Create from pre-loaded components
+    pub fn from_components(
+        self_attn: GroupedQueryAttention<B>,
+        mlp: MLP<B>,
+        input_layernorm: RmsNorm<B>,
+        post_attention_layernorm: RmsNorm<B>,
+    ) -> Self {
+        Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        }
+    }
+
+    /// Load from SafeTensor data
+    pub fn from_safetensors(
+        data: &SafeTensorData,
+        layer_idx: usize,
+        config: &LlamaConfig,
+        device: &B::Device,
+    ) -> Result<Self> {
+        let layer_prefix = format!("model.layers.{}", layer_idx);
+
+        let self_attn =
+            GroupedQueryAttention::from_safetensors(data, &layer_prefix, config, device)?;
+
+        let mlp = MLP::from_safetensors(
+            data,
+            &layer_prefix,
+            config.hidden_size,
+            config.intermediate_size,
+            device,
+        )?;
+
+        let input_layernorm = RmsNorm::from_safetensors(
+            data,
+            &format!("{}.input_layernorm.weight", layer_prefix),
+            config.hidden_size,
+            config.rms_norm_eps,
+            device,
+        )?;
+
+        let post_attention_layernorm = RmsNorm::from_safetensors(
+            data,
+            &format!("{}.post_attention_layernorm.weight", layer_prefix),
+            config.hidden_size,
+            config.rms_norm_eps,
+            device,
+        )?;
+
+        Ok(Self::from_components(
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        ))
     }
 
     /// Forward pass
