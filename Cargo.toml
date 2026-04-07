@@ -1,0 +1,77 @@
+[package]
+name = "pdf_summarizer"
+version = "0.1.0"
+edition = "2021"
+authors = ["PDF Summarizer Team"]
+description = "A CLI tool for PDF text extraction and summarization using LLaMA 3 with Burn"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Burn ML framework with WGPU backend for GPU (cross-platform)
+burn = { version = "0.16", default-features = false, features = ["wgpu", "autodiff", "std"] }
+
+# PDF text extraction
+pdf-extract = "0.7"
+lopdf = "0.34"
+
+# Tokenization for LLaMA
+tokenizers = "0.20"
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Progress bars
+indicatif = "0.17"
+
+# File handling
+walkdir = "2.5"
+glob = "0.3"
+dirs = "5.0"
+
+# Async streaming for downloads
+futures-util = "0.3"
+
+# Memory mapping for large model files
+memmap2 = "0.9"
+
+# Numeric operations
+num-traits = "0.2"
+half = { version = "2.4", features = ["num-traits"] }
+
+# SafeTensors for model loading
+safetensors = "0.4"
+
+# HTTP client for model downloading
+reqwest = { version = "0.12", features = ["blocking", "stream", "json"] }
+
+# Byteorder for binary parsing
+byteorder = "1.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[[bin]]
+name = "pdf-summarizer"
+path = "src/main.rs"

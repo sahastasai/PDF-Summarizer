@@ -1,0 +1,99 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE and Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# Model files (large binaries)
+*.safetensors
+*.bin
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.onnx
+models/
+*.model
+
+# Tokenizer files (can be large)
+tokenizer.json
+tokenizer.model
+
+# Log files
+*.log
+logs/
+
+# Test artifacts
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Documentation build
+/doc/
+/docs/build/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+tmp/
+temp/
+
+# Package manager
+.cargo/
+!.cargo/config.toml
+
+# Benchmark results
+criterion/
+benches/target/
+
+# Debug files
+*.dSYM/
+*.pdb
+
+# PDF test files (optional - uncomment if you want to ignore test PDFs)
+# *.pdf
+# test_pdfs/
+
+# Downloaded cache
+.pdf_summarizer/
