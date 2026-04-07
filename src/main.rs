@@ -49,6 +49,24 @@ fn init_logging(verbosity: u8) {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 }
 
+/// Select the best available WGPU device
+fn select_device(use_cpu: bool, _gpu_device: usize) -> WgpuDevice {
+    if use_cpu {
+        info!("Using CPU backend (as requested)");
+        return WgpuDevice::Cpu;
+    }
+
+    // Use DefaultDevice which automatically selects the best available device
+    // based on the CUBECL_WGPU_DEFAULT_DEVICE env var or auto-detection.
+    // This handles cases where no discrete GPU is available.
+    info!("Selecting default compute device (auto-detection)...");
+    
+    let device = WgpuDevice::DefaultDevice;
+    
+    info!("Using device: {:?}", device);
+    device
+}
+
 /// Main application entry point
 fn main() -> Result<()> {
     // Parse command line arguments
@@ -90,14 +108,8 @@ fn run(args: Args) -> Result<()> {
         pdf_contents.len()
     );
 
-    // Initialize device
-    let device = if args.use_cpu {
-        info!("Using CPU backend");
-        WgpuDevice::Cpu
-    } else {
-        info!("Using GPU device {}", args.gpu_device);
-        WgpuDevice::DiscreteGpu(args.gpu_device)
-    };
+    // Initialize device with fallback logic
+    let device = select_device(args.use_cpu, args.gpu_device);
 
     // Get model path (download if necessary)
     info!("Checking for model...");
