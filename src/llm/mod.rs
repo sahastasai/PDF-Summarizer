@@ -9,5 +9,5 @@ pub mod loader;
 pub mod model;
 
 pub use config::LlamaConfig;
-pub use loader::ModelLoader;
+pub use loader::{ModelLoader, SafeTensorData};
 pub use model::Llama;

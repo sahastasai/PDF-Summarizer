@@ -122,6 +122,42 @@ impl SafeTensorData {
         Ok(Tensor::from_data(tensor_data, device))
     }
 
+    pub fn get_tensor_2d_transposed<B: Backend>(
+        &self,
+        name: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, 2>> {
+        let buffer_idx = self
+            .name_to_buffer
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Weight not found: {}", name))?;
+
+        let tensors = SafeTensors::deserialize(&self.buffers[*buffer_idx])?;
+        let tensor_view = tensors.tensor(name)?;
+        let shape = tensor_view.shape();
+        let data = tensor_view.data();
+
+        // Verify shape
+        if shape.len() != 2 {
+            anyhow::bail!("Expected 2D tensor for {}, got shape {:?}", name, shape);
+        }
+
+        let floats = self.convert_to_f32(data, tensor_view.dtype())?;
+        let rows = shape[0];
+        let cols = shape[1];
+
+        // Transpose the data manually to ensure it's contiguous in memory
+        let mut transposed_floats = vec![0.0; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed_floats[c * rows + r] = floats[r * cols + c];
+            }
+        }
+
+        let tensor_data = burn::tensor::TensorData::new(transposed_floats, vec![cols, rows]);
+        Ok(Tensor::from_data(tensor_data, device))
+    }
+
     /// Check if a weight exists
     pub fn has_weight(&self, name: &str) -> bool {
         self.name_to_buffer.contains_key(name)
@@ -167,24 +203,21 @@ pub fn load_linear<B: Backend>(
     );
 
     // HuggingFace stores weights as [out_features, in_features]
-    let weight = data.get_tensor_2d::<B>(weight_name, device)?;
+    // We transpose it immediately upon loading so it's a contiguous tensor
+    let weight_transposed = data.get_tensor_2d_transposed::<B>(weight_name, device)?;
 
     // Verify shape
-    let [rows, cols] = weight.dims();
-    if rows != out_features || cols != in_features {
+    let [rows, cols] = weight_transposed.dims();
+    if rows != in_features || cols != out_features {
         anyhow::bail!(
             "Shape mismatch for {}: expected [{}, {}], got [{}, {}]",
             weight_name,
-            out_features,
             in_features,
+            out_features,
             rows,
             cols
         );
     }
-
-    // Burn Linear layers expect weights as [in_features, out_features]
-    // but HuggingFace stores them as [out_features, in_features], so we need to transpose
-    let weight_transposed = weight.swap_dims(0, 1);
 
     // Create Linear with no bias
     let mut linear = LinearConfig::new(in_features, out_features)

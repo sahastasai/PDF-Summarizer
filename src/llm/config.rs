@@ -102,22 +102,37 @@ impl LlamaConfig {
         let content = std::fs::read_to_string(path)?;
         let config: serde_json::Value = serde_json::from_str(&content)?;
 
+        let hidden_size = config["hidden_size"].as_u64().unwrap_or(4096) as usize;
+        let num_attention_heads = config["num_attention_heads"].as_u64().unwrap_or(32) as usize;
+
+        // Compute head_dim from hidden_size and num_attention_heads if not provided
+        let head_dim = config["head_dim"]
+            .as_u64()
+            .map(|v| v as usize)
+            .unwrap_or_else(|| hidden_size / num_attention_heads);
+
+        // Handle pad_token_id - fallback to eos_token_id if not present
+        let eos_token_id = config["eos_token_id"].as_u64().unwrap_or(2) as u32;
+        let pad_token_id = config["pad_token_id"]
+            .as_u64()
+            .unwrap_or(eos_token_id as u64) as u32;
+
         Ok(Self {
-            vocab_size: config["vocab_size"].as_u64().unwrap_or(128256) as usize,
-            hidden_size: config["hidden_size"].as_u64().unwrap_or(4096) as usize,
+            vocab_size: config["vocab_size"].as_u64().unwrap_or(32000) as usize,
+            hidden_size,
             intermediate_size: config["intermediate_size"].as_u64().unwrap_or(14336) as usize,
-            num_attention_heads: config["num_attention_heads"].as_u64().unwrap_or(32) as usize,
+            num_attention_heads,
             num_key_value_heads: config["num_key_value_heads"].as_u64().unwrap_or(8) as usize,
             num_hidden_layers: config["num_hidden_layers"].as_u64().unwrap_or(32) as usize,
             rms_norm_eps: config["rms_norm_eps"].as_f64().unwrap_or(1e-5),
             max_position_embeddings: config["max_position_embeddings"].as_u64().unwrap_or(8192)
                 as usize,
-            rope_theta: config["rope_theta"].as_f64().unwrap_or(500000.0),
-            bos_token_id: config["bos_token_id"].as_u64().unwrap_or(128000) as u32,
-            eos_token_id: config["eos_token_id"].as_u64().unwrap_or(128001) as u32,
-            pad_token_id: config["pad_token_id"].as_u64().unwrap_or(128002) as u32,
+            rope_theta: config["rope_theta"].as_f64().unwrap_or(10000.0),
+            bos_token_id: config["bos_token_id"].as_u64().unwrap_or(1) as u32,
+            eos_token_id,
+            pad_token_id,
             tie_word_embeddings: config["tie_word_embeddings"].as_bool().unwrap_or(false),
-            head_dim: config["head_dim"].as_u64().unwrap_or(128) as usize,
+            head_dim,
         })
     }
 

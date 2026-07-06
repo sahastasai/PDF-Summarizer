@@ -7,10 +7,9 @@ use burn::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{debug, info};
 
-use crate::llm::{Llama, LlamaConfig, ModelLoader};
+use crate::llm::{Llama, LlamaConfig, ModelLoader, SafeTensorData};
 use crate::pdf::PdfContent;
 use crate::tokenizer::{ChatTemplate, Tokenizer};
-
 /// Generation parameters
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
@@ -86,7 +85,7 @@ impl<B: Backend> SummarizationPipeline<B> {
         }
     }
 
-    /// Initialize the pipeline from model path
+    /// Initialize the pipeline from model path with pretrained weights
     pub fn from_path(
         model_path: &std::path::Path,
         tokenizer_path: Option<&std::path::Path>,
@@ -99,9 +98,16 @@ impl<B: Backend> SummarizationPipeline<B> {
         let loader = ModelLoader::new(model_path.to_path_buf())?;
         let model_config = loader.config().clone();
 
-        // Initialize model
-        info!("Loading LLaMA model...");
-        let model = Llama::new(&device, &model_config);
+        // Validate model files exist
+        loader.validate()?;
+
+        // Load weights from SafeTensors
+        info!("Loading model weights from {:?}...", model_path);
+        let weights = SafeTensorData::load(&model_path.to_path_buf())?;
+
+        // Initialize model with pretrained weights
+        info!("Building LLaMA model with pretrained weights...");
+        let model = Llama::from_pretrained(&weights, &model_config, &device)?;
 
         // Load tokenizer
         let tokenizer_path = tokenizer_path
@@ -111,6 +117,7 @@ impl<B: Backend> SummarizationPipeline<B> {
         info!("Loading tokenizer from {:?}", tokenizer_path);
         let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
 
+        info!("Pipeline initialized successfully!");
         Ok(Self {
             model,
             tokenizer,
@@ -131,7 +138,11 @@ impl<B: Backend> SummarizationPipeline<B> {
         let input_ids = self.tokenizer.encode_with_bos(&prompt)?;
 
         // Truncate if necessary
-        let max_input = self.config.max_context - self.config.max_new_tokens;
+        let actual_max_context = std::cmp::min(
+            self.config.max_context,
+            self.model_config.max_position_embeddings,
+        );
+        let max_input = actual_max_context.saturating_sub(self.config.max_new_tokens);
         let input_ids = if input_ids.len() > max_input {
             info!(
                 "Truncating input from {} to {} tokens",
@@ -217,7 +228,9 @@ impl<B: Backend> SummarizationPipeline<B> {
     /// Convert token IDs to a tensor
     fn ids_to_tensor(&self, ids: &[u32]) -> Tensor<B, 2, Int> {
         let ids_i64: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
-        Tensor::<B, 1, Int>::from_ints(ids_i64.as_slice(), &self.device).unsqueeze_dim(0)
+        let len = ids.len();
+        let tensor_data = burn::tensor::TensorData::new(ids_i64, vec![1, len]);
+        Tensor::from_data(tensor_data, &self.device)
     }
 
     /// Get the tokenizer

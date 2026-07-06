@@ -14,6 +14,7 @@ pub mod tokenizer;
 
 use anyhow::{Context, Result};
 use burn::backend::wgpu::{Wgpu, WgpuDevice};
+use burn::backend::ndarray::{NdArray, NdArrayDevice};
 use clap::Parser;
 use std::time::Instant;
 use tracing::{info, warn, Level};
@@ -25,8 +26,11 @@ use output::OutputWriter;
 use pdf::process_pdfs_with_progress;
 use pipeline::{GenerationConfig, SummarizationPipeline};
 
-/// Type alias for our backend (WebGPU for cross-platform GPU support)
-type Backend = Wgpu;
+/// Type alias for our GPU backend (WebGPU for cross-platform GPU support)
+type GpuBackend = Wgpu;
+
+/// Type alias for our CPU backend (NdArray)
+type CpuBackend = NdArray;
 
 /// Initialize logging based on verbosity level
 fn init_logging(verbosity: u8) {
@@ -47,24 +51,6 @@ fn init_logging(verbosity: u8) {
         .finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-}
-
-/// Select the best available WGPU device
-fn select_device(use_cpu: bool, _gpu_device: usize) -> WgpuDevice {
-    if use_cpu {
-        info!("Using CPU backend (as requested)");
-        return WgpuDevice::Cpu;
-    }
-
-    // Use DefaultDevice which automatically selects the best available device
-    // based on the CUBECL_WGPU_DEFAULT_DEVICE env var or auto-detection.
-    // This handles cases where no discrete GPU is available.
-    info!("Selecting default compute device (auto-detection)...");
-    
-    let device = WgpuDevice::DefaultDevice;
-    
-    info!("Using device: {:?}", device);
-    device
 }
 
 /// Main application entry point
@@ -108,9 +94,6 @@ fn run(args: Args) -> Result<()> {
         pdf_contents.len()
     );
 
-    // Initialize device with fallback logic
-    let device = select_device(args.use_cpu, args.gpu_device);
-
     // Get model path (download if necessary)
     info!("Checking for model...");
     let model_path = ensure_model_available_sync(
@@ -133,14 +116,22 @@ fn run(args: Args) -> Result<()> {
         max_context: args.max_context,
     };
 
-    // Initialize the pipeline
-    info!("Initializing LLaMA model...");
-    let pipeline: SummarizationPipeline<Backend> =
-        SummarizationPipeline::from_path(&model_path, tokenizer_path, gen_config, device)?;
-
-    // Process PDFs and generate summaries
-    info!("Generating summaries...");
-    let results = pipeline.summarize_batch(&pdf_contents)?;
+    // Run with appropriate backend
+    let results = if args.use_cpu {
+        info!("Using CPU backend (NdArray)");
+        let device = NdArrayDevice::Cpu;
+        let pipeline: SummarizationPipeline<CpuBackend> =
+            SummarizationPipeline::from_path(&model_path, tokenizer_path, gen_config, device)?;
+        info!("Generating summaries...");
+        pipeline.summarize_batch(&pdf_contents)?
+    } else {
+        info!("Using GPU backend (WGPU)");
+        let device = WgpuDevice::DefaultDevice;
+        let pipeline: SummarizationPipeline<GpuBackend> =
+            SummarizationPipeline::from_path(&model_path, tokenizer_path, gen_config, device)?;
+        info!("Generating summaries...");
+        pipeline.summarize_batch(&pdf_contents)?
+    };
 
     // Write output
     let output_path = args.output.as_deref();

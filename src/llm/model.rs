@@ -2,12 +2,14 @@
 //!
 //! Full model architecture combining all components.
 
+use anyhow::Result;
 use burn::prelude::*;
 use tracing::{debug, info};
 
 use super::attention::DecoderLayer;
 use super::config::LlamaConfig;
 use super::layers::{LMHead, RmsNorm, RmsNormConfig, TokenEmbedding};
+use super::loader::SafeTensorData;
 
 /// KV Cache for efficient generation
 pub type KVCache<B> = Vec<Option<(Tensor<B, 4>, Tensor<B, 4>)>>;
@@ -26,10 +28,10 @@ pub struct Llama<B: Backend> {
 }
 
 impl<B: Backend> Llama<B> {
-    /// Create a new LLaMA model
+    /// Create a new LLaMA model with random weights (for testing only)
     pub fn new(device: &B::Device, config: &LlamaConfig) -> Self {
         info!(
-            "Initializing LLaMA model with {} layers",
+            "Initializing LLaMA model with {} layers (random weights)",
             config.num_hidden_layers
         );
 
@@ -54,6 +56,65 @@ impl<B: Backend> Llama<B> {
             norm,
             lm_head,
         }
+    }
+
+    /// Load a pretrained model from SafeTensor weights
+    pub fn from_pretrained(
+        data: &SafeTensorData,
+        config: &LlamaConfig,
+        device: &B::Device,
+    ) -> Result<Self> {
+        info!(
+            "Loading pretrained LLaMA model with {} layers",
+            config.num_hidden_layers
+        );
+
+        // Load token embeddings
+        info!("Loading token embeddings...");
+        let embed_tokens = TokenEmbedding::from_safetensors(
+            data,
+            "model.embed_tokens.weight",
+            config.vocab_size,
+            config.hidden_size,
+            device,
+        )?;
+
+        // Load decoder layers
+        info!("Loading {} decoder layers...", config.num_hidden_layers);
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            debug!("Loading layer {}/{}", i + 1, config.num_hidden_layers);
+            let layer = DecoderLayer::from_safetensors(data, i, config, device)?;
+            layers.push(layer);
+        }
+
+        // Load final norm
+        info!("Loading final layer norm...");
+        let norm = RmsNorm::from_safetensors(
+            data,
+            "model.norm.weight",
+            config.hidden_size,
+            config.rms_norm_eps,
+            device,
+        )?;
+
+        // Load LM head
+        info!("Loading LM head...");
+        let lm_head = LMHead::from_safetensors(
+            data,
+            "lm_head.weight",
+            config.hidden_size,
+            config.vocab_size,
+            device,
+        )?;
+
+        info!("Model loaded successfully!");
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
     /// Forward pass
@@ -129,8 +190,8 @@ impl<B: Backend> Llama<B> {
             })
             .collect();
 
-        Tensor::<B, 2>::from_floats(mask_data.as_slice(), device)
-            .reshape([seq_len, total_len])
+        let tensor_data = burn::tensor::TensorData::new(mask_data, vec![seq_len, total_len]);
+        Tensor::<B, 2>::from_data(tensor_data, device)
             .unsqueeze_dim::<3>(0)
             .unsqueeze_dim::<4>(0)
             .repeat_dim(0, batch_size)
@@ -153,7 +214,15 @@ impl<B: Backend> Llama<B> {
         let mut kv_cache: Option<KVCache<B>> = None;
         let mut position_offset = 0;
 
+        let start_time = std::time::Instant::now();
+        info!(
+            "Starting generation loop for up to {} tokens...",
+            max_new_tokens
+        );
+
         for step in 0..max_new_tokens {
+            let step_start = std::time::Instant::now();
+
             // Get the input for this step
             let current_input = if step == 0 {
                 generated.clone()
@@ -196,10 +265,32 @@ impl<B: Backend> Llama<B> {
             // Check for EOS token (simplified check for first batch item)
             let next_token_data = next_token.to_data();
             let next_token_val = next_token_data.iter::<i64>().next().unwrap_or(0);
+
+            let elapsed = step_start.elapsed();
+            if step == 0 {
+                info!(
+                    "First token generated in {:.2}s (prefill). Token ID: {}",
+                    elapsed.as_secs_f64(),
+                    next_token_val
+                );
+            } else if step % 10 == 0 || next_token_val == config.eos_token_id as i64 {
+                info!(
+                    "Step {}/{} | Token ID: {} | Time: {:.2}s",
+                    step + 1,
+                    max_new_tokens,
+                    next_token_val,
+                    elapsed.as_secs_f64()
+                );
+            }
+
             if next_token_val == config.eos_token_id as i64 {
+                info!("EOS token reached.");
                 break;
             }
         }
+
+        let total_time = start_time.elapsed();
+        info!("Generation complete in {:.2}s", total_time.as_secs_f64());
 
         generated
     }
